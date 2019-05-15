@@ -164,7 +164,7 @@ exports.createTemplate = (options, messages) => {
     const fileMenu = template[0];
 
     // These are in reverse order, since we're prepending them one at a time
-    if (options.development) {
+    /*if (options.development)*/ {
       fileMenu.submenu.unshift({
         label: messages.menuSetupAsStandalone.message,
         click: setupAsStandalone,
