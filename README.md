@@ -1,3 +1,11 @@
+# Signal Desktop Standalone
+
+Patch for signal that includes standalone mode in release builds.
+Standalone allows one to use the desktop application without the need for the smartphone software. Useful for those who have older mobile devices or otherwise do not want to use the phone app.
+Binaries are available on release page.
+
+##
+
 [![Build Status](https://travis-ci.org/signalapp/Signal-Desktop.svg?branch=master)](https://travis-ci.org/signalapp/Signal-Desktop)
 [![Build Status](https://ci.appveyor.com/api/projects/status/github/signalapp/Signal-Desktop?branch=master&svg=true)](https://ci.appveyor.com/project/Signal-Desktop/signal-desktop)
 
