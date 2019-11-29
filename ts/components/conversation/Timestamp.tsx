@@ -11,6 +11,9 @@ interface Props {
   extended?: boolean;
   module?: string;
   withImageNoCaption?: boolean;
+  withSticker?: boolean;
+  withTapToViewExpired?: boolean;
+  withUnread?: boolean;
   direction?: 'incoming' | 'outgoing';
   i18n: LocalizerType;
 }
@@ -48,6 +51,9 @@ export class Timestamp extends React.Component<Props> {
       module,
       timestamp,
       withImageNoCaption,
+      withSticker,
+      withTapToViewExpired,
+      withUnread,
       extended,
     } = this.props;
     const moduleName = module || 'module-timestamp';
@@ -61,7 +67,12 @@ export class Timestamp extends React.Component<Props> {
         className={classNames(
           moduleName,
           direction ? `${moduleName}--${direction}` : null,
-          withImageNoCaption ? `${moduleName}--with-image-no-caption` : null
+          withTapToViewExpired && direction
+            ? `${moduleName}--${direction}-with-tap-to-view-expired`
+            : null,
+          withImageNoCaption ? `${moduleName}--with-image-no-caption` : null,
+          withSticker ? `${moduleName}--with-sticker` : null,
+          withUnread ? `${moduleName}--with-unread` : null
         )}
         title={moment(timestamp).format('llll')}
       >

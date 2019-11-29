@@ -1,6 +1,6 @@
 /* global $, Whisper */
 
-$(document).on('keyup', e => {
+$(document).on('keydown', e => {
   'use strict';
 
   if (e.keyCode === 27) {
@@ -9,7 +9,23 @@ $(document).on('keyup', e => {
 });
 
 const $body = $(document.body);
-$body.addClass(`${window.theme}-theme`);
+
+async function applyTheme() {
+  'use strict';
+
+  const theme = await window.getThemeSetting();
+  $body.removeClass('light-theme');
+  $body.removeClass('dark-theme');
+  $body.addClass(`${theme === 'system' ? window.systemTheme : theme}-theme`);
+}
+
+applyTheme();
+
+window.subscribeToSystemThemeChange(() => {
+  'use strict';
+
+  applyTheme();
+});
 
 // eslint-disable-next-line strict
 const getInitialData = async () => ({

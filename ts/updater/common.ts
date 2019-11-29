@@ -3,7 +3,7 @@ import {
   statSync,
   writeFile as writeFileCallback,
 } from 'fs';
-import { join } from 'path';
+import { join, normalize } from 'path';
 import { tmpdir } from 'os';
 
 // @ts-ignore
@@ -19,6 +19,8 @@ import pify from 'pify';
 import mkdirp from 'mkdirp';
 import rimraf from 'rimraf';
 import { app, BrowserWindow, dialog } from 'electron';
+
+import { getTempPath } from '../../app/attachments';
 
 // @ts-ignore
 import * as packageJson from '../../package.json';
@@ -78,6 +80,16 @@ export async function checkForUpdates(
   return null;
 }
 
+export function validatePath(basePath: string, targetPath: string) {
+  const normalized = normalize(targetPath);
+
+  if (!normalized.startsWith(basePath)) {
+    throw new Error(
+      `validatePath: Path ${normalized} is not under base path ${basePath}`
+    );
+  }
+}
+
 export async function downloadUpdate(
   fileName: string,
   logger: LoggerType
@@ -93,6 +105,9 @@ export async function downloadUpdate(
     tempDir = await createTempDir();
     const targetUpdatePath = join(tempDir, fileName);
     const targetSignaturePath = join(tempDir, getSignatureFileName(fileName));
+
+    validatePath(tempDir, targetUpdatePath);
+    validatePath(tempDir, targetSignaturePath);
 
     logger.info(`downloadUpdate: Downloading ${signatureUrl}`);
     const { body } = await get(signatureUrl, getGotOptions());
@@ -145,26 +160,15 @@ export async function showUpdateDialog(
     cancelId: RESTART_BUTTON,
   };
 
-  return new Promise(resolve => {
-    dialog.showMessageBox(mainWindow, options, response => {
-      if (response === RESTART_BUTTON) {
-        // It's key to delay any install calls here because they don't seem to work inside this
-        //   callback - but only if the message box has a parent window.
-        // Fixes this: https://github.com/signalapp/Signal-Desktop/issues/1864
-        resolve(true);
+  const { response } = await dialog.showMessageBox(mainWindow, options);
 
-        return;
-      }
-
-      resolve(false);
-    });
-  });
+  return response === RESTART_BUTTON;
 }
 
 export async function showCannotUpdateDialog(
   mainWindow: BrowserWindow,
   messages: MessagesType
-): Promise<boolean> {
+): Promise<any> {
   const options = {
     type: 'error',
     buttons: [messages.ok.message],
@@ -172,11 +176,7 @@ export async function showCannotUpdateDialog(
     message: messages.cannotUpdateDetail.message,
   };
 
-  return new Promise(resolve => {
-    dialog.showMessageBox(mainWindow, options, () => {
-      resolve();
-    });
-  });
+  await dialog.showMessageBox(mainWindow, options);
 }
 
 // Helper functions
@@ -226,14 +226,26 @@ export function getVersion(yaml: string): string | undefined {
   return;
 }
 
+const validFile = /^[A-Za-z0-9\.\-]+$/;
+export function isUpdateFileNameValid(name: string) {
+  return validFile.test(name);
+}
+
 export function getUpdateFileName(yaml: string) {
   const info = parseYaml(yaml);
 
-  if (info && info.path) {
-    return info.path;
+  if (!info || !info.path) {
+    throw new Error('getUpdateFileName: No path present in YAML file');
   }
 
-  return;
+  const path = info.path;
+  if (!isUpdateFileNameValid(path)) {
+    throw new Error(
+      `getUpdateFileName: Path '${path}' contains invalid characters`
+    );
+  }
+
+  return path;
 }
 
 function parseYaml(yaml: string): any {
@@ -269,7 +281,7 @@ function getGotOptions(): GotOptions<null> {
 
 function getBaseTempDir() {
   // We only use tmpdir() when this code is run outside of an Electron app (as in: tests)
-  return app ? join(app.getPath('userData'), 'temp') : tmpdir();
+  return app ? getTempPath(app.getPath('userData')) : tmpdir();
 }
 
 export async function createTempDir() {
@@ -301,11 +313,6 @@ export async function deleteTempDir(targetDir: string) {
 
 export function getPrintableError(error: Error) {
   return error && error.stack ? error.stack : error;
-}
-
-export async function deleteBaseTempDir() {
-  const baseTempDir = getBaseTempDir();
-  await rimrafPromise(baseTempDir);
 }
 
 export function getCliOptions<T>(options: any): T {

@@ -17,9 +17,19 @@ module.exports = {
       components: 'ts/components/conversation/[^_]*.tsx',
     },
     {
+      name: 'Emoji',
+      description: 'All components related to emojis',
+      components: 'ts/components/emoji/[^_]*.tsx',
+    },
+    {
       name: 'Media Gallery',
       description: 'Display media and documents in a conversation',
       components: 'ts/components/conversation/media-gallery/[^_]*.tsx',
+    },
+    {
+      name: 'Stickers',
+      description: 'All components related to stickers',
+      components: 'ts/components/stickers/[^_]*.tsx',
     },
     {
       name: 'Utility',
@@ -52,6 +62,11 @@ module.exports = {
           type: 'text/css',
           href: '/stylesheets/manifest.css',
         },
+        {
+          rel: 'stylesheet',
+          type: 'text/css',
+          href: '/node_modules/draft-js/dist/Draft.css',
+        },
       ],
     },
   },
@@ -73,7 +88,7 @@ module.exports = {
         },
         {
           // To test handling of attachments, we need arraybuffers in memory
-          test: /\.(gif|mp3|mp4|txt|jpg|jpeg|png)$/,
+          test: /\.(gif|mp3|mp4|txt|jpg|jpeg|png|webp)$/,
           loader: 'arraybuffer-loader',
         },
       ],

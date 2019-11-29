@@ -27,20 +27,16 @@
   };
 
   const { Util } = window.Signal;
+  const { Conversation, Contact, Message, PhoneNumber } = window.Signal.Types;
   const {
-    Conversation,
-    Contact,
-    Errors,
-    Message,
-    PhoneNumber,
-  } = window.Signal.Types;
-  const {
-    upgradeMessageSchema,
-    loadAttachmentData,
-    getAbsoluteAttachmentPath,
-    writeNewAttachmentData,
     deleteAttachmentData,
+    getAbsoluteAttachmentPath,
+    loadAttachmentData,
+    readStickerData,
+    upgradeMessageSchema,
+    writeNewAttachmentData,
   } = window.Signal.Migrations;
+  const { addStickerPackReference } = window.Signal.Data;
 
   const COLORS = [
     'red',
@@ -105,14 +101,14 @@
       this.messageCollection.on('send-error', this.onMessageError, this);
 
       this.throttledBumpTyping = _.throttle(this.bumpTyping, 300);
-      const debouncedUpdateLastMessage = _.debounce(
+      this.debouncedUpdateLastMessage = _.debounce(
         this.updateLastMessage.bind(this),
         200
       );
       this.listenTo(
         this.messageCollection,
-        'add remove destroy',
-        debouncedUpdateLastMessage
+        'add remove destroy content-changed',
+        this.debouncedUpdateLastMessage
       );
       this.listenTo(this.messageCollection, 'sent', this.updateLastMessage);
       this.listenTo(
@@ -152,6 +148,34 @@
 
     isMe() {
       return this.id === this.ourNumber;
+    },
+
+    hasDraft() {
+      const draftAttachments = this.get('draftAttachments') || [];
+      return (
+        this.get('draft') ||
+        this.get('quotedMessageId') ||
+        draftAttachments.length > 0
+      );
+    },
+
+    getDraftPreview() {
+      const draft = this.get('draft');
+      if (draft) {
+        return draft;
+      }
+
+      const draftAttachments = this.get('draftAttachments') || [];
+      if (draftAttachments.length > 0) {
+        return i18n('Conversation--getDraftPreview--attachment');
+      }
+
+      const quotedMessageId = this.get('quotedMessageId');
+      if (quotedMessageId) {
+        return i18n('Conversation--getDraftPreview--quote');
+      }
+
+      return i18n('Conversation--getDraftPreview--draft');
     },
 
     bumpTyping() {
@@ -244,7 +268,7 @@
     },
 
     async updateAndMerge(message) {
-      this.updateLastMessage();
+      this.debouncedUpdateLastMessage();
 
       const mergeMessage = () => {
         const existing = this.messageCollection.get(message.id);
@@ -260,7 +284,7 @@
     },
 
     async onExpired(message) {
-      this.updateLastMessage();
+      this.debouncedUpdateLastMessage();
 
       const removeMessage = () => {
         const { id } = message;
@@ -275,6 +299,7 @@
 
         this.messageCollection.remove(id);
         existing.trigger('expired');
+        existing.cleanup();
       };
 
       // If a fetch is in progress, then we need to wait until that's complete to
@@ -286,18 +311,33 @@
     },
 
     async onNewMessage(message) {
-      await this.updateLastMessage();
-
       // Clear typing indicator for a given contact if we receive a message from them
       const identifier = message.get
         ? `${message.get('source')}.${message.get('sourceDevice')}`
         : `${message.source}.${message.sourceDevice}`;
       this.clearContactTypingTimer(identifier);
+
+      this.debouncedUpdateLastMessage();
     },
 
     addSingleMessage(message) {
+      const { id } = message;
+      const existing = this.messageCollection.get(id);
+
       const model = this.messageCollection.add(message, { merge: true });
       model.setToExpire();
+
+      if (!existing) {
+        const { messagesAdded } = window.reduxActions.conversations;
+        const isNewMessage = true;
+        messagesAdded(
+          this.id,
+          [model.getReduxData()],
+          isNewMessage,
+          window.isActive()
+        );
+      }
+
       return model;
     },
 
@@ -308,7 +348,19 @@
       const { format } = PhoneNumber;
       const regionCode = storage.get('regionCode');
       const color = this.getColor();
-      const typingKeys = Object.keys(this.contactTypingTimers || {});
+
+      const typingValues = _.values(this.contactTypingTimers || {});
+      const typingMostRecent = _.first(_.sortBy(typingValues, 'timestamp'));
+      const typingContact = typingMostRecent
+        ? ConversationController.getOrCreate(typingMostRecent.sender, 'private')
+        : null;
+
+      const timestamp = this.get('timestamp');
+      const draftTimestamp = this.get('draftTimestamp');
+      const draftPreview = this.getDraftPreview();
+      const draftText = this.get('draft');
+      const shouldShowDraft =
+        this.hasDraft() && draftTimestamp && draftTimestamp >= timestamp;
 
       const result = {
         id: this.id,
@@ -319,13 +371,17 @@
         color,
         type: this.isPrivate() ? 'direct' : 'group',
         isMe: this.isMe(),
-        isTyping: typingKeys.length > 0,
+        typingContact: typingContact ? typingContact.format() : null,
         lastUpdated: this.get('timestamp'),
         name: this.getName(),
         profileName: this.getProfileName(),
-        timestamp: this.get('timestamp'),
+        timestamp,
         title: this.getTitle(),
         unreadCount: this.get('unreadCount') || 0,
+
+        shouldShowDraft,
+        draftPreview,
+        draftText,
 
         phoneNumber: format(this.id, {
           ourRegionCode: regionCode,
@@ -353,12 +409,10 @@
         await this.initialPromise;
         const verified = await this.safeGetVerified();
 
-        this.set({ verified });
-
-        // we don't await here because we don't need to wait for this to finish
-        window.Signal.Data.updateConversation(this.id, this.attributes, {
-          Conversation: Whisper.Conversation,
-        });
+        if (this.get('verified') !== verified) {
+          this.set({ verified });
+          window.Signal.Data.updateConversation(this.id, this.attributes);
+        }
 
         return;
       }
@@ -421,9 +475,7 @@
       }
 
       this.set({ verified });
-      await window.Signal.Data.updateConversation(this.id, this.attributes, {
-        Conversation: Whisper.Conversation,
-      });
+      window.Signal.Data.updateConversation(this.id, this.attributes);
 
       // Three situations result in a verification notice in the conversation:
       //   1) The message came from an explicit verification in another client (not
@@ -611,14 +663,15 @@
       const id = await window.Signal.Data.saveMessage(message, {
         Message: Whisper.Message,
       });
-
-      this.trigger(
-        'newmessage',
+      const model = MessageController.register(
+        id,
         new Whisper.Message({
           ...message,
           id,
         })
       );
+
+      this.trigger('newmessage', model);
     },
     async addVerifiedChange(verifiedChangeId, verified, providedOptions) {
       const options = providedOptions || {};
@@ -655,14 +708,15 @@
       const id = await window.Signal.Data.saveMessage(message, {
         Message: Whisper.Message,
       });
-
-      this.trigger(
-        'newmessage',
+      const model = MessageController.register(
+        id,
         new Whisper.Message({
           ...message,
           id,
         })
       );
+
+      this.trigger('newmessage', model);
 
       if (this.isPrivate()) {
         ConversationController.getAllGroupsInvolvingId(this.id).then(groups => {
@@ -734,23 +788,14 @@
     },
 
     queueJob(callback) {
-      const previous = this.pending || Promise.resolve();
+      this.jobQueue = this.jobQueue || new window.PQueue({ concurrency: 1 });
 
       const taskWithTimeout = textsecure.createTaskWithTimeout(
         callback,
         `conversation ${this.idForLogging()}`
       );
 
-      this.pending = previous.then(taskWithTimeout, taskWithTimeout);
-      const current = this.pending;
-
-      current.then(() => {
-        if (this.pending === current) {
-          delete this.pending;
-        }
-      });
-
-      return current;
+      return this.jobQueue.add(taskWithTimeout);
     },
 
     getRecipients() {
@@ -761,7 +806,7 @@
       return _.without(this.get('members'), me);
     },
 
-    async getQuoteAttachment(attachments, preview) {
+    async getQuoteAttachment(attachments, preview, sticker) {
       if (attachments && attachments.length) {
         return Promise.all(
           attachments
@@ -817,6 +862,23 @@
         );
       }
 
+      if (sticker && sticker.data && sticker.data.path) {
+        const { path, contentType } = sticker.data;
+
+        return [
+          {
+            contentType,
+            // Our protos library complains about this field being undefined, so we
+            //   force it to null
+            fileName: null,
+            thumbnail: {
+              ...(await loadAttachmentData(sticker.data)),
+              objectUrl: getAbsoluteAttachmentPath(path),
+            },
+          },
+        ];
+      }
+
       return [];
     },
 
@@ -825,6 +887,7 @@
       const contact = quotedMessage.getContact();
       const attachments = quotedMessage.get('attachments');
       const preview = quotedMessage.get('preview');
+      const sticker = quotedMessage.get('sticker');
 
       const body = quotedMessage.get('body');
       const embeddedContact = quotedMessage.get('contact');
@@ -837,12 +900,52 @@
         author: contact.id,
         id: quotedMessage.get('sent_at'),
         text: body || embeddedContactName,
-        attachments: await this.getQuoteAttachment(attachments, preview),
+        attachments: quotedMessage.isTapToView()
+          ? [{ contentType: 'image/jpeg', fileName: null }]
+          : await this.getQuoteAttachment(attachments, preview, sticker),
       };
     },
 
-    sendMessage(body, attachments, quote, preview) {
+    async sendStickerMessage(packId, stickerId) {
+      if (!window.ENABLE_STICKER_SEND) {
+        return;
+      }
+
+      const packData = window.Signal.Stickers.getStickerPack(packId);
+      const stickerData = window.Signal.Stickers.getSticker(packId, stickerId);
+      if (!stickerData || !packData) {
+        window.log.warn(
+          `Attempted to send nonexistent (${packId}, ${stickerId}) sticker!`
+        );
+        return;
+      }
+
+      const { key } = packData;
+      const { path, width, height } = stickerData;
+      const arrayBuffer = await readStickerData(path);
+
+      const sticker = {
+        packId,
+        stickerId,
+        packKey: key,
+        data: {
+          size: arrayBuffer.byteLength,
+          data: arrayBuffer,
+          contentType: 'image/webp',
+          width,
+          height,
+        },
+      };
+
+      this.sendMessage(null, [], null, [], sticker);
+      window.reduxActions.stickers.useSticker(packId, stickerId);
+    },
+
+    sendMessage(body, attachments, quote, preview, sticker) {
       this.clearTypingTimers();
+
+      const { clearUnreadMetrics } = window.reduxActions.conversations;
+      clearUnreadMetrics(this.id);
 
       const destination = this.id;
       const expireTimer = this.get('expireTimer');
@@ -863,6 +966,7 @@
           now
         );
 
+        // Here we move attachments to disk
         const messageWithSchema = await upgradeMessageSchema({
           type: 'outgoing',
           body,
@@ -874,6 +978,7 @@
           received_at: now,
           expireTimer,
           recipients,
+          sticker,
         });
 
         if (this.isPrivate()) {
@@ -885,6 +990,9 @@
         };
 
         const model = this.addSingleMessage(attributes);
+        if (sticker) {
+          await addStickerPackReference(model.id, sticker.packId);
+        }
         const message = MessageController.register(model.id, model);
         await window.Signal.Data.saveMessage(message.attributes, {
           forceSave: true,
@@ -897,10 +1005,10 @@
           active_at: now,
           timestamp: now,
           isArchived: false,
+          draft: null,
+          draftTimestamp: null,
         });
-        await window.Signal.Data.updateConversation(this.id, this.attributes, {
-          Conversation: Whisper.Conversation,
-        });
+        window.Signal.Data.updateConversation(this.id, this.attributes);
 
         // We're offline!
         if (!textsecure.messaging) {
@@ -935,6 +1043,7 @@
             finalAttachments,
             quote,
             preview,
+            sticker,
             now,
             expireTimer,
             profileKey
@@ -955,6 +1064,7 @@
                 finalAttachments,
                 quote,
                 preview,
+                sticker,
                 now,
                 expireTimer,
                 profileKey,
@@ -968,6 +1078,7 @@
                 finalAttachments,
                 quote,
                 preview,
+                sticker,
                 now,
                 expireTimer,
                 profileKey,
@@ -1024,10 +1135,9 @@
             conversation.set({
               sealedSender: SEALED_SENDER.DISABLED,
             });
-            await window.Signal.Data.updateConversation(
+            window.Signal.Data.updateConversation(
               conversation.id,
-              conversation.attributes,
-              { Conversation: Whisper.Conversation }
+              conversation.attributes
             );
           }
         })
@@ -1056,10 +1166,9 @@
                 sealedSender: SEALED_SENDER.UNRESTRICTED,
               });
             }
-            await window.Signal.Data.updateConversation(
+            window.Signal.Data.updateConversation(
               conversation.id,
-              conversation.attributes,
-              { Conversation: Whisper.Conversation }
+              conversation.attributes
             );
           }
         })
@@ -1144,12 +1253,21 @@
         return;
       }
 
-      const messages = await window.Signal.Data.getMessagesByConversation(
+      const messages = await window.Signal.Data.getOlderMessagesByConversation(
         this.id,
         { limit: 1, MessageCollection: Whisper.MessageCollection }
       );
 
       const lastMessageModel = messages.at(0);
+      if (
+        this.hasDraft() &&
+        this.get('draftTimestamp') &&
+        (!lastMessageModel ||
+          lastMessageModel.get('sent_at') < this.get('draftTimestamp'))
+      ) {
+        return;
+      }
+
       const lastMessageJSON = lastMessageModel
         ? lastMessageModel.toJSON()
         : null;
@@ -1171,7 +1289,7 @@
       this.set(lastMessageUpdate);
 
       if (this.hasChanged()) {
-        await window.Signal.Data.updateConversation(this.id, this.attributes, {
+        window.Signal.Data.updateConversation(this.id, this.attributes, {
           Conversation: Whisper.Conversation,
         });
       }
@@ -1179,9 +1297,7 @@
 
     async setArchived(isArchived) {
       this.set({ isArchived });
-      await window.Signal.Data.updateConversation(this.id, this.attributes, {
-        Conversation: Whisper.Conversation,
-      });
+      window.Signal.Data.updateConversation(this.id, this.attributes);
     },
 
     async updateExpirationTimer(
@@ -1218,11 +1334,9 @@
       const timestamp = (receivedAt || Date.now()) - 1;
 
       this.set({ expireTimer });
-      await window.Signal.Data.updateConversation(this.id, this.attributes, {
-        Conversation: Whisper.Conversation,
-      });
+      window.Signal.Data.updateConversation(this.id, this.attributes);
 
-      const message = this.messageCollection.add({
+      const model = new Whisper.Message({
         // Even though this isn't reflected to the user, we want to place the last seen
         //   indicator above it. We set it to 'unread' to trigger that placement.
         unread: 1,
@@ -1238,17 +1352,21 @@
           fromGroupUpdate: options.fromGroupUpdate,
         },
       });
-      if (this.isPrivate()) {
-        message.set({ destination: this.id });
-      }
-      if (message.isOutgoing()) {
-        message.set({ recipients: this.getRecipients() });
-      }
 
-      const id = await window.Signal.Data.saveMessage(message.attributes, {
+      if (this.isPrivate()) {
+        model.set({ destination: this.id });
+      }
+      if (model.isOutgoing()) {
+        model.set({ recipients: this.getRecipients() });
+      }
+      const id = await window.Signal.Data.saveMessage(model.attributes, {
         Message: Whisper.Message,
       });
-      message.set({ id });
+
+      model.set({ id });
+
+      const message = MessageController.register(id, model);
+      this.addSingleMessage(message);
 
       // if change was made remotely, don't send it to the number/group
       if (receivedAt) {
@@ -1271,6 +1389,7 @@
           [],
           null,
           [],
+          null,
           message.get('sent_at'),
           expireTimer,
           profileKey,
@@ -1310,7 +1429,7 @@
     async endSession() {
       if (this.isPrivate()) {
         const now = Date.now();
-        const message = this.messageCollection.add({
+        const model = new Whisper.Message({
           conversationId: this.id,
           type: 'outgoing',
           sent_at: now,
@@ -1320,10 +1439,13 @@
           flags: textsecure.protobuf.DataMessage.Flags.END_SESSION,
         });
 
-        const id = await window.Signal.Data.saveMessage(message.attributes, {
+        const id = await window.Signal.Data.saveMessage(model.attributes, {
           Message: Whisper.Message,
         });
-        message.set({ id });
+        model.set({ id });
+
+        const message = MessageController.register(model.id, model);
+        this.addSingleMessage(message);
 
         const options = this.getSendOptions();
         message.send(
@@ -1344,7 +1466,7 @@
         groupUpdate = this.pick(['name', 'avatar', 'members']);
       }
       const now = Date.now();
-      const message = this.messageCollection.add({
+      const model = new Whisper.Message({
         conversationId: this.id,
         type: 'outgoing',
         sent_at: now,
@@ -1352,10 +1474,14 @@
         group_update: groupUpdate,
       });
 
-      const id = await window.Signal.Data.saveMessage(message.attributes, {
+      const id = await window.Signal.Data.saveMessage(model.attributes, {
         Message: Whisper.Message,
       });
-      message.set({ id });
+
+      model.set({ id });
+
+      const message = MessageController.register(model.id, model);
+      this.addSingleMessage(message);
 
       const options = this.getSendOptions();
       message.send(
@@ -1376,11 +1502,9 @@
       if (this.get('type') === 'group') {
         const groupNumbers = this.getRecipients();
         this.set({ left: true });
-        await window.Signal.Data.updateConversation(this.id, this.attributes, {
-          Conversation: Whisper.Conversation,
-        });
+        window.Signal.Data.updateConversation(this.id, this.attributes);
 
-        const message = this.messageCollection.add({
+        const model = new Whisper.Message({
           group_update: { left: 'You' },
           conversationId: this.id,
           type: 'outgoing',
@@ -1388,10 +1512,13 @@
           received_at: now,
         });
 
-        const id = await window.Signal.Data.saveMessage(message.attributes, {
+        const id = await window.Signal.Data.saveMessage(model.attributes, {
           Message: Whisper.Message,
         });
-        message.set({ id });
+        model.set({ id });
+
+        const message = MessageController.register(model.id, model);
+        this.addSingleMessage(message);
 
         const options = this.getSendOptions();
         message.send(
@@ -1422,14 +1549,9 @@
         _.map(oldUnread, async providedM => {
           const m = MessageController.register(providedM.id, providedM);
 
-          if (!this.messageCollection.get(m.id)) {
-            window.log.warn(
-              'Marked a message as read in the database, but ' +
-                'it was not in messageCollection.'
-            );
-          }
-
+          // Note that this will update the message in the database
           await m.markRead(options.readAt);
+
           const errors = m.get('errors');
           return {
             sender: m.get('source'),
@@ -1445,9 +1567,7 @@
 
       const unreadCount = unreadMessages.length - read.length;
       this.set({ unreadCount });
-      await window.Signal.Data.updateConversation(this.id, this.attributes, {
-        Conversation: Whisper.Conversation,
-      });
+      window.Signal.Data.updateConversation(this.id, this.attributes);
 
       // If a message has errors, we don't want to send anything out about it.
       //   read syncs - let's wait for a client that really understands the message
@@ -1517,12 +1637,13 @@
       //   clear the changed fields here so our hasChanged() check is useful.
       c.changed = {};
 
+      let profile;
+
       try {
         await c.deriveAccessKeyIfNeeded();
         const numberInfo = c.getNumberInfo({ disableMeCheck: true }) || {};
         const getInfo = numberInfo[c.id] || {};
 
-        let profile;
         if (getInfo.accessKey) {
           try {
             profile = await textsecure.messaging.getProfile(id, {
@@ -1603,11 +1724,6 @@
             sealedSender: SEALED_SENDER.DISABLED,
           });
         }
-
-        await c.setProfileName(profile.name);
-
-        // This might throw if we can't pull the avatar down, so we do it last
-        await c.setProfileAvatar(profile.avatar);
       } catch (error) {
         if (error.code !== 403 && error.code !== 404) {
           window.log.error(
@@ -1615,13 +1731,36 @@
             id,
             error && error.stack ? error.stack : error
           );
+        } else {
+          await c.dropProfileKey();
         }
-      } finally {
-        if (c.hasChanged()) {
-          await window.Signal.Data.updateConversation(id, c.attributes, {
-            Conversation: Whisper.Conversation,
+        return;
+      }
+
+      try {
+        await c.setProfileName(profile.name);
+      } catch (error) {
+        window.log.error(
+          'getProfile decryption error:',
+          id,
+          error && error.stack ? error.stack : error
+        );
+        await c.dropProfileKey();
+        return;
+      }
+
+      try {
+        await c.setProfileAvatar(profile.avatar);
+      } catch (error) {
+        if (error.code === 403 || error.code === 404) {
+          c.set({
+            profileAvatar: null,
           });
         }
+      }
+
+      if (c.hasChanged()) {
+        window.Signal.Data.updateConversation(id, c.attributes);
       }
     },
     async setProfileName(encryptedName) {
@@ -1689,14 +1828,37 @@
         this.set({
           profileKey,
           accessKey: null,
+          profileName: null,
+          profileAvatar: null,
           sealedSender: SEALED_SENDER.UNKNOWN,
         });
 
         await this.deriveAccessKeyIfNeeded();
 
-        await window.Signal.Data.updateConversation(this.id, this.attributes, {
+        window.Signal.Data.updateConversation(this.id, this.attributes, {
           Conversation: Whisper.Conversation,
         });
+      }
+    },
+    async dropProfileKey() {
+      if (this.get('profileKey')) {
+        window.log.info(
+          `Dropping profileKey, setting sealedSender to UNKNOWN for conversation ${this.idForLogging()}`
+        );
+        const profileAvatar = this.get('profileAvatar');
+        if (profileAvatar && profileAvatar.path) {
+          await deleteAttachmentData(profileAvatar.path);
+        }
+
+        this.set({
+          profileAvatar: null,
+          profileKey: null,
+          profileName: null,
+          accessKey: null,
+          sealedSender: SEALED_SENDER.UNKNOWN,
+        });
+
+        window.Signal.Data.updateConversation(this.id, this.attributes);
       }
     },
 
@@ -1719,57 +1881,6 @@
         accessKeyBuffer
       );
       this.set({ accessKey });
-    },
-
-    async upgradeMessages(messages) {
-      for (let max = messages.length, i = 0; i < max; i += 1) {
-        const message = messages.at(i);
-        const { attributes } = message;
-        const { schemaVersion } = attributes;
-
-        if (schemaVersion < Message.VERSION_NEEDED_FOR_DISPLAY) {
-          // Yep, we really do want to wait for each of these
-          // eslint-disable-next-line no-await-in-loop
-          const upgradedMessage = await upgradeMessageSchema(attributes);
-          message.set(upgradedMessage);
-          // eslint-disable-next-line no-await-in-loop
-          await window.Signal.Data.saveMessage(upgradedMessage, {
-            Message: Whisper.Message,
-          });
-        }
-      }
-    },
-
-    async fetchMessages() {
-      if (!this.id) {
-        throw new Error('This conversation has no id!');
-      }
-      if (this.inProgressFetch) {
-        window.log.warn('Attempting to start a parallel fetchMessages() call');
-        return;
-      }
-
-      this.inProgressFetch = this.messageCollection.fetchConversation(
-        this.id,
-        undefined,
-        this.get('unreadCount')
-      );
-
-      await this.inProgressFetch;
-
-      try {
-        // We are now doing the work to upgrade messages before considering the load from
-        //   the database complete. Note that we do save messages back, so it is a
-        //   one-time hit. We do this so we have guarantees about message structure.
-        await this.upgradeMessages(this.messageCollection);
-      } catch (error) {
-        window.log.error(
-          'fetchMessages: failed to upgrade messages',
-          Errors.toLogFormat(error)
-        );
-      }
-
-      this.inProgressFetch = null;
     },
 
     hasMember(number) {
@@ -1799,10 +1910,6 @@
     },
 
     async destroyMessages() {
-      await window.Signal.Data.removeAllMessagesInConversation(this.id, {
-        MessageCollection: Whisper.MessageCollection,
-      });
-
       this.messageCollection.reset([]);
 
       this.set({
@@ -1810,8 +1917,10 @@
         timestamp: null,
         active_at: null,
       });
-      await window.Signal.Data.updateConversation(this.id, this.attributes, {
-        Conversation: Whisper.Conversation,
+      window.Signal.Data.updateConversation(this.id, this.attributes);
+
+      await window.Signal.Data.removeAllMessagesInConversation(this.id, {
+        MessageCollection: Whisper.MessageCollection,
       });
     },
 
@@ -1830,7 +1939,7 @@
     },
 
     getProfileName() {
-      if (this.isPrivate() && !this.get('name')) {
+      if (this.isPrivate()) {
         return this.get('profileName');
       }
       return null;
@@ -1905,7 +2014,9 @@
       return migrateColor(this.get('color'));
     },
     getAvatarPath() {
-      const avatar = this.get('avatar') || this.get('profileAvatar');
+      const avatar = this.isMe()
+        ? this.get('profileAvatar') || this.get('avatar')
+        : this.get('avatar') || this.get('profileAvatar');
 
       if (avatar && avatar.path) {
         return getAbsoluteAttachmentPath(avatar.path);
@@ -1956,11 +2067,6 @@
           const messageId = message.id;
           const isExpiringMessage = Message.hasExpiration(messageJSON);
 
-          window.log.info('Add notification', {
-            conversationId: this.idForLogging(),
-            isExpiringMessage,
-            messageSentAt,
-          });
           Whisper.Notifications.add({
             conversationId,
             iconUrl,
@@ -1991,10 +2097,6 @@
         clearTimeout(record.timer);
       }
 
-      // Note: We trigger two events because:
-      //   'typing-update' is a surgical update ConversationView does for in-convo bubble
-      //   'change' causes a re-render of this conversation's list item in the left pane
-
       if (isTyping) {
         this.contactTypingTimers[identifier] = this.contactTypingTimers[
           identifier
@@ -2010,14 +2112,12 @@
         );
         if (!record) {
           // User was not previously typing before. State change!
-          this.trigger('typing-update');
           this.trigger('change', this);
         }
       } else {
         delete this.contactTypingTimers[identifier];
         if (record) {
           // User was previously typing, and is no longer. State change!
-          this.trigger('typing-update');
           this.trigger('change', this);
         }
       }
@@ -2032,7 +2132,6 @@
         delete this.contactTypingTimers[identifier];
 
         // User was previously typing, but timed out or we received message. State change!
-        this.trigger('typing-update');
         this.trigger('change', this);
       }
     },
@@ -2043,17 +2142,6 @@
 
     comparator(m) {
       return -m.get('timestamp');
-    },
-
-    async destroyAll() {
-      await Promise.all(
-        this.models.map(conversation =>
-          window.Signal.Data.removeConversation(conversation.id, {
-            Conversation: Whisper.Conversation,
-          })
-        )
-      );
-      this.reset([]);
     },
   });
 

@@ -1,6 +1,7 @@
 import { instance, PhoneNumberFormat } from '../util/libphonenumberInstance';
+import memoizee from 'memoizee';
 
-export function format(
+function _format(
   phoneNumber: string,
   options: {
     ourRegionCode: string;
@@ -20,6 +21,13 @@ export function format(
     return phoneNumber;
   }
 }
+
+export const format = memoizee(_format, {
+  primitive: true,
+  // Convert the arguments to a unique string, required for primitive mode.
+  normalizer: (...args) => JSON.stringify(args),
+  max: 5000,
+});
 
 export function parse(
   phoneNumber: string,

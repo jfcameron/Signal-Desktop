@@ -696,7 +696,7 @@ async function exportConversation(conversation, options = {}) {
 
   while (!complete) {
     // eslint-disable-next-line no-await-in-loop
-    const collection = await window.Signal.Data.getMessagesByConversation(
+    const collection = await window.Signal.Data.getOlderMessagesByConversation(
       conversation.id,
       {
         limit: CHUNK_SIZE,
@@ -715,7 +715,7 @@ async function exportConversation(conversation, options = {}) {
       count += 1;
 
       // skip message if it is disappearing, no matter the amount of time left
-      if (message.expireTimer) {
+      if (message.expireTimer || message.messageTimer || message.isViewOnce) {
         // eslint-disable-next-line no-continue
         continue;
       }

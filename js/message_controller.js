@@ -12,6 +12,10 @@
   const HOUR = MINUTE * 60;
 
   function register(id, message) {
+    if (!id || !message) {
+      return message;
+    }
+
     const existing = messageLookup[id];
     if (existing) {
       messageLookup[id] = {
@@ -50,6 +54,11 @@
     }
   }
 
+  function getById(id) {
+    const existing = messageLookup[id];
+    return existing && existing.message ? existing.message : null;
+  }
+
   function _get() {
     return messageLookup;
   }
@@ -60,6 +69,7 @@
     register,
     unregister,
     cleanup,
+    getById,
     _get,
   };
 })();

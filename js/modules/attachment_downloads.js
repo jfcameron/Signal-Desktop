@@ -1,6 +1,14 @@
-/* global Whisper, Signal, setTimeout, clearTimeout, MessageController */
+/* global
+  ConversationController,
+  Whisper,
+  Signal,
+  setTimeout,
+  clearTimeout,
+  MessageController
+*/
 
 const { isFunction, isNumber, omit } = require('lodash');
+const { computeHash } = require('./types/conversation');
 const getGuid = require('uuid/v4');
 const {
   getMessageById,
@@ -102,6 +110,11 @@ async function addJob(attachment, job = {}) {
 }
 
 async function _tick() {
+  if (timeout) {
+    clearTimeout(timeout);
+    timeout = null;
+  }
+
   _maybeStartJob();
   timeout = setTimeout(_tick, TICK_INTERVAL);
 }
@@ -133,7 +146,12 @@ async function _maybeStartJob() {
   const jobs = nextJobs.slice(0, Math.min(needed, nextJobs.length));
   for (let i = 0, max = jobs.length; i < max; i += 1) {
     const job = jobs[i];
-    _activeAttachmentDownloadJobs[job.id] = _runJob(job);
+    const existing = _activeAttachmentDownloadJobs[job.id];
+    if (existing) {
+      logger.warn(`_maybeStartJob: Job ${job.id} is already running`);
+    } else {
+      _activeAttachmentDownloadJobs[job.id] = _runJob(job);
+    }
   }
 }
 
@@ -148,9 +166,11 @@ async function _runJob(job) {
       );
     }
 
-    const found = await getMessageById(messageId, {
-      Message: Whisper.Message,
-    });
+    const found =
+      MessageController.getById(messageId) ||
+      (await getMessageById(messageId, {
+        Message: Whisper.Message,
+      }));
     if (!found) {
       logger.error('_runJob: Source message not found, deleting job');
       await _finishJob(null, id);
@@ -245,9 +265,6 @@ async function _finishJob(message, id) {
 
       if (fromConversation && message !== fromConversation) {
         fromConversation.set(message.attributes);
-        fromConversation.trigger('change', fromConversation);
-      } else {
-        message.trigger('change', message);
       }
     }
   }
@@ -295,7 +312,13 @@ async function _addAttachmentToMessage(message, attachment, { type, index }) {
         `_addAttachmentToMessage: attachments didn't exist or ${index} was too large`
       );
     }
-    _replaceAttachment(attachments, index, attachment, logPrefix);
+    _checkOldAttachment(attachments, index, attachment, logPrefix);
+
+    const newAttachments = [...attachments];
+    newAttachments[index] = attachment;
+
+    message.set({ attachments: newAttachments });
+
     return;
   }
 
@@ -310,7 +333,17 @@ async function _addAttachmentToMessage(message, attachment, { type, index }) {
     if (!item) {
       throw new Error(`_addAttachmentToMessage: preview ${index} was falsey`);
     }
-    _replaceAttachment(item, 'image', attachment, logPrefix);
+
+    _checkOldAttachment(item, 'image', attachment, logPrefix);
+
+    const newPreview = [...preview];
+    newPreview[index] = {
+      ...preview[index],
+      image: attachment,
+    };
+
+    message.set({ preview: newPreview });
+
     return;
   }
 
@@ -323,7 +356,18 @@ async function _addAttachmentToMessage(message, attachment, { type, index }) {
     }
     const item = contact[index];
     if (item && item.avatar && item.avatar.avatar) {
-      _replaceAttachment(item.avatar, 'avatar', attachment, logPrefix);
+      _checkOldAttachment(item.avatar, 'avatar', attachment, logPrefix);
+
+      const newContact = [...contact];
+      newContact[index] = {
+        ...contact[index],
+        avatar: {
+          ...contact[index].avatar,
+          avatar: attachment,
+        },
+      };
+
+      message.set({ contact: newContact });
     } else {
       logger.warn(
         `_addAttachmentToMessage: Couldn't update contact with avatar attachment for message ${message.idForLogging()}`
@@ -348,25 +392,66 @@ async function _addAttachmentToMessage(message, attachment, { type, index }) {
     const item = attachments[index];
     if (!item) {
       throw new Error(
-        `_addAttachmentToMessage: attachment ${index} was falsey`
+        `_addAttachmentToMessage: quote attachment ${index} was falsey`
       );
     }
-    _replaceAttachment(item, 'thumbnail', attachment, logPrefix);
+
+    _checkOldAttachment(item, 'thumbnail', attachment, logPrefix);
+
+    const newAttachments = [...attachments];
+    newAttachments[index] = {
+      ...attachments[index],
+      thumbnail: attachment,
+    };
+
+    const newQuote = {
+      ...quote,
+      attachments: newAttachments,
+    };
+
+    message.set({ quote: newQuote });
+
     return;
   }
 
   if (type === 'group-avatar') {
-    const group = message.get('group');
-    if (!group) {
-      throw new Error("_addAttachmentToMessage: group didn't exist");
+    const conversationId = message.get('conversationId');
+    const conversation = ConversationController.get(conversationId);
+    if (!conversation) {
+      logger.warn("_addAttachmentToMessage: conversation didn't exist");
+      return;
     }
 
-    const existingAvatar = group.avatar;
+    const existingAvatar = conversation.get('avatar');
     if (existingAvatar && existingAvatar.path) {
       await Signal.Migrations.deleteAttachmentData(existingAvatar.path);
     }
 
-    _replaceAttachment(group, 'avatar', attachment, logPrefix);
+    const loadedAttachment = await Signal.Migrations.loadAttachmentData(
+      attachment
+    );
+    conversation.set({
+      avatar: {
+        ...attachment,
+        hash: await computeHash(loadedAttachment.data),
+      },
+    });
+    Signal.Data.updateConversation(conversationId, conversation.attributes);
+    return;
+  }
+
+  if (type === 'sticker') {
+    const sticker = message.get('sticker');
+    if (!sticker) {
+      throw new Error("_addAttachmentToMessage: sticker didn't exist");
+    }
+
+    message.set({
+      sticker: {
+        ...sticker,
+        data: attachment,
+      },
+    });
     return;
   }
 
@@ -375,14 +460,14 @@ async function _addAttachmentToMessage(message, attachment, { type, index }) {
   );
 }
 
-function _replaceAttachment(object, key, newAttachment, logPrefix) {
+function _checkOldAttachment(object, key, newAttachment, logPrefix) {
   const oldAttachment = object[key];
   if (oldAttachment && oldAttachment.path) {
-    logger.warn(
-      `_replaceAttachment: ${logPrefix} - old attachment already had path, not replacing`
+    logger.error(
+      `_checkOldAttachment: ${logPrefix} - old attachment already had path, not replacing`
+    );
+    throw new Error(
+      '_checkOldAttachment: old attachment already had path, not replacing'
     );
   }
-
-  // eslint-disable-next-line no-param-reassign
-  object[key] = newAttachment;
 }

@@ -21,10 +21,15 @@ interface Change {
   contacts?: Array<Contact>;
 }
 
-interface Props {
+export type PropsData = {
   changes: Array<Change>;
+};
+
+type PropsHousekeeping = {
   i18n: LocalizerType;
-}
+};
+
+type Props = PropsData & PropsHousekeeping;
 
 export class GroupNotification extends React.Component<Props> {
   public renderChange(change: Change) {
@@ -40,7 +45,6 @@ export class GroupNotification extends React.Component<Props> {
               className="module-group-notification__contact"
             >
               <ContactName
-                i18n={i18n}
                 phoneNumber={contact.phoneNumber}
                 profileName={contact.profileName}
                 name={contact.name}

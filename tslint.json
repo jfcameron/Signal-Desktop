@@ -77,6 +77,9 @@
       }
     ],
 
+    // Crashing!
+    "use-default-type-parameter": false,
+
     // Disabling a large set of Microsoft-recommended rules
 
     // Modifying:
@@ -90,7 +93,13 @@
       "allow-pascal-case"
     ],
 
-    "function-name": [true, { "function-regex": "^_?[a-z][\\w\\d]+$" }],
+    "function-name": [
+      true,
+      {
+        "function-regex": "^_?[a-z][\\w\\d]+$",
+        "static-method-regex": "^_?[a-z][\\w\\d]+$"
+      }
+    ],
 
     // Adding select dev dependencies here for now, may turn on all in the future
     "no-implicit-dependencies": [true, ["dashdash", "electron"]],

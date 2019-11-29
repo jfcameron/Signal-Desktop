@@ -5,7 +5,7 @@ import { Avatar } from '../Avatar';
 import { Spinner } from '../Spinner';
 
 import { LocalizerType } from '../../types/Util';
-import { Contact, getName } from '../../types/Contact';
+import { ContactType, getName } from '../../types/Contact';
 
 // This file starts with _ to keep it from showing up in the StyleGuide.
 
@@ -15,22 +15,27 @@ export function renderAvatar({
   size,
   direction,
 }: {
-  contact: Contact;
+  contact: ContactType;
   i18n: LocalizerType;
-  size: number;
-  direction?: string;
+  size: 28 | 52 | 80;
+  direction?: 'outgoing' | 'incoming';
 }) {
   const { avatar } = contact;
 
   const avatarPath = avatar && avatar.avatar && avatar.avatar.path;
   const pending = avatar && avatar.avatar && avatar.avatar.pending;
   const name = getName(contact) || '';
-  const spinnerSize = size < 50 ? 'small' : 'normal';
+  const spinnerSvgSize = size < 50 ? 'small' : 'normal';
+  const spinnerSize = size < 50 ? '24px' : undefined;
 
   if (pending) {
     return (
       <div className="module-embedded-contact__spinner-container">
-        <Spinner size={spinnerSize} direction={direction} />
+        <Spinner
+          svgSize={spinnerSvgSize}
+          size={spinnerSize}
+          direction={direction}
+        />
       </div>
     );
   }
@@ -52,7 +57,7 @@ export function renderName({
   isIncoming,
   module,
 }: {
-  contact: Contact;
+  contact: ContactType;
   isIncoming: boolean;
   module: string;
 }) {
@@ -73,7 +78,7 @@ export function renderContactShorthand({
   isIncoming,
   module,
 }: {
-  contact: Contact;
+  contact: ContactType;
   isIncoming: boolean;
   module: string;
 }) {

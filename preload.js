@@ -1,12 +1,23 @@
-/* global Whisper: false */
-/* global window: false */
+/* global Whisper, window */
 
 const electron = require('electron');
 const semver = require('semver');
+const curve = require('curve25519-n');
 
 const { deferredToPromise } = require('./js/modules/deferred_to_promise');
 
-const { app } = electron.remote;
+const { remote } = electron;
+const { app } = remote;
+const { systemPreferences } = remote.require('electron');
+
+const browserWindow = remote.getCurrentWindow();
+window.isFocused = () => browserWindow.isFocused();
+
+// Waiting for clients to implement changes on receive side
+window.ENABLE_STICKER_SEND = true;
+window.TIMESTAMP_VALIDATION = false;
+window.PAD_ALL_ATTACHMENTS = false;
+window.SEND_RECIPIENT_UPDATES = false;
 
 window.PROTO_ROOT = 'protos';
 const config = require('url').parse(window.location.toString(), true).query;
@@ -30,6 +41,25 @@ window.getNodeVersion = () => config.node_version;
 window.getHostName = () => config.hostname;
 window.getServerTrustRoot = () => config.serverTrustRoot;
 window.isBehindProxy = () => Boolean(config.proxyUrl);
+
+function setSystemTheme() {
+  window.systemTheme = systemPreferences.isDarkMode() ? 'dark' : 'light';
+}
+
+setSystemTheme();
+
+window.subscribeToSystemThemeChange = fn => {
+  if (!systemPreferences.subscribeNotification) {
+    return;
+  }
+  systemPreferences.subscribeNotification(
+    'AppleInterfaceThemeChangedNotification',
+    () => {
+      setSystemTheme();
+      fn();
+    }
+  );
+};
 
 window.isBeforeVersion = (toCheck, baseVersion) => {
   try {
@@ -98,17 +128,14 @@ ipc.on('set-up-as-standalone', () => {
 window.showSettings = () => ipc.send('show-settings');
 window.showPermissionsPopup = () => ipc.send('show-permissions-popup');
 
+ipc.on('show-keyboard-shortcuts', () => {
+  window.Events.showKeyboardShortcuts();
+});
 ipc.on('add-dark-overlay', () => {
-  const { addDarkOverlay } = window.Events;
-  if (addDarkOverlay) {
-    addDarkOverlay();
-  }
+  window.Events.addDarkOverlay();
 });
 ipc.on('remove-dark-overlay', () => {
-  const { removeDarkOverlay } = window.Events;
-  if (removeDarkOverlay) {
-    removeDarkOverlay();
-  }
+  window.Events.removeDarkOverlay();
 });
 
 installGetter('device-name', 'getDeviceName');
@@ -130,12 +157,24 @@ window.getMediaPermissions = () =>
   new Promise((resolve, reject) => {
     ipc.once('get-success-media-permissions', (_event, error, value) => {
       if (error) {
-        return reject(error);
+        return reject(new Error(error));
       }
 
       return resolve(value);
     });
     ipc.send('get-media-permissions');
+  });
+
+window.getBuiltInImages = () =>
+  new Promise((resolve, reject) => {
+    ipc.once('get-success-built-in-images', (_event, error, value) => {
+      if (error) {
+        return reject(new Error(error));
+      }
+
+      return resolve(value);
+    });
+    ipc.send('get-built-in-images');
   });
 
 installGetter('is-primary', 'isPrimary');
@@ -147,6 +186,14 @@ ipc.on('delete-all-data', () => {
   const { deleteAllData } = window.Events;
   if (deleteAllData) {
     deleteAllData();
+  }
+});
+
+ipc.on('show-sticker-pack', (_event, info) => {
+  const { packId, packKey } = info;
+  const { showStickerPack } = window.Events;
+  if (showStickerPack) {
+    showStickerPack(packId, packKey);
   }
 });
 
@@ -245,7 +292,6 @@ const { autoOrientImage } = require('./js/modules/auto_orient_image');
 window.autoOrientImage = autoOrientImage;
 window.dataURLToBlobSync = require('blueimp-canvas-to-blob');
 window.emojiData = require('emoji-datasource');
-window.EmojiPanel = require('emoji-panel');
 window.filesize = require('filesize');
 window.libphonenumber = require('google-libphonenumber').PhoneNumberUtil.getInstance();
 window.libphonenumber.PhoneNumberFormat = require('google-libphonenumber').PhoneNumberFormat;
@@ -255,6 +301,7 @@ window.getGuid = require('uuid/v4');
 window.React = require('react');
 window.ReactDOM = require('react-dom');
 window.moment = require('moment');
+window.PQueue = require('p-queue');
 
 const Signal = require('./js/modules/signal');
 const i18n = require('./js/modules/i18n');
@@ -271,12 +318,101 @@ window.moment.updateLocale(locale, {
 });
 window.moment.locale(locale);
 
+const userDataPath = app.getPath('userData');
+window.baseAttachmentsPath = Attachments.getPath(userDataPath);
+window.baseStickersPath = Attachments.getStickersPath(userDataPath);
+window.baseTempPath = Attachments.getTempPath(userDataPath);
+window.baseDraftPath = Attachments.getDraftPath(userDataPath);
 window.Signal = Signal.setup({
   Attachments,
-  userDataPath: app.getPath('userData'),
+  userDataPath,
   getRegionCode: () => window.storage.get('regionCode'),
   logger: window.log,
 });
+
+function wrapWithPromise(fn) {
+  return (...args) => Promise.resolve(fn(...args));
+}
+function typedArrayToArrayBuffer(typedArray) {
+  const { buffer, byteOffset, byteLength } = typedArray;
+  return buffer.slice(byteOffset, byteLength + byteOffset);
+}
+const externalCurve = {
+  generateKeyPair: () => {
+    const { privKey, pubKey } = curve.generateKeyPair();
+
+    return {
+      privKey: typedArrayToArrayBuffer(privKey),
+      pubKey: typedArrayToArrayBuffer(pubKey),
+    };
+  },
+  createKeyPair: incomingKey => {
+    const incomingKeyBuffer = Buffer.from(incomingKey);
+    const { privKey, pubKey } = curve.createKeyPair(incomingKeyBuffer);
+
+    return {
+      privKey: typedArrayToArrayBuffer(privKey),
+      pubKey: typedArrayToArrayBuffer(pubKey),
+    };
+  },
+  calculateAgreement: (pubKey, privKey) => {
+    const pubKeyBuffer = Buffer.from(pubKey);
+    const privKeyBuffer = Buffer.from(privKey);
+
+    const buffer = curve.calculateAgreement(pubKeyBuffer, privKeyBuffer);
+
+    return typedArrayToArrayBuffer(buffer);
+  },
+  verifySignature: (pubKey, message, signature) => {
+    const pubKeyBuffer = Buffer.from(pubKey);
+    const messageBuffer = Buffer.from(message);
+    const signatureBuffer = Buffer.from(signature);
+
+    const result = curve.verifySignature(
+      pubKeyBuffer,
+      messageBuffer,
+      signatureBuffer
+    );
+
+    return result;
+  },
+  calculateSignature: (privKey, message) => {
+    const privKeyBuffer = Buffer.from(privKey);
+    const messageBuffer = Buffer.from(message);
+
+    const buffer = curve.calculateSignature(privKeyBuffer, messageBuffer);
+
+    return typedArrayToArrayBuffer(buffer);
+  },
+  validatePubKeyFormat: pubKey => {
+    const pubKeyBuffer = Buffer.from(pubKey);
+
+    return curve.validatePubKeyFormat(pubKeyBuffer);
+  },
+};
+externalCurve.ECDHE = externalCurve.calculateAgreement;
+externalCurve.Ed25519Sign = externalCurve.calculateSignature;
+externalCurve.Ed25519Verify = externalCurve.verifySignature;
+const externalCurveAsync = {
+  generateKeyPair: wrapWithPromise(externalCurve.generateKeyPair),
+  createKeyPair: wrapWithPromise(externalCurve.createKeyPair),
+  calculateAgreement: wrapWithPromise(externalCurve.calculateAgreement),
+  verifySignature: async (...args) => {
+    // The async verifySignature function has a different signature than the sync function
+    const verifyFailed = externalCurve.verifySignature(...args);
+    if (verifyFailed) {
+      throw new Error('Invalid signature');
+    }
+  },
+  calculateSignature: wrapWithPromise(externalCurve.calculateSignature),
+  validatePubKeyFormat: wrapWithPromise(externalCurve.validatePubKeyFormat),
+  ECDHE: wrapWithPromise(externalCurve.ECDHE),
+  Ed25519Sign: wrapWithPromise(externalCurve.Ed25519Sign),
+  Ed25519Verify: wrapWithPromise(externalCurve.Ed25519Verify),
+};
+window.libsignal = window.libsignal || {};
+window.libsignal.externalCurve = externalCurve;
+window.libsignal.externalCurveAsync = externalCurveAsync;
 
 // Pulling these in separately since they access filesystem, electron
 window.Signal.Backup = require('./js/modules/backup');

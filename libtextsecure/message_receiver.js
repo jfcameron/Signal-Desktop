@@ -9,111 +9,10 @@
 /* global _: false */
 /* global ContactBuffer: false */
 /* global GroupBuffer: false */
-/* global Worker: false */
 
 /* eslint-disable more/no-then */
 
-const WORKER_TIMEOUT = 60 * 1000; // one minute
-
-const _utilWorker = new Worker('js/util_worker.js');
-const _jobs = Object.create(null);
-const _DEBUG = false;
-let _jobCounter = 0;
-
-function _makeJob(fnName) {
-  _jobCounter += 1;
-  const id = _jobCounter;
-
-  if (_DEBUG) {
-    window.log.info(`Worker job ${id} (${fnName}) started`);
-  }
-  _jobs[id] = {
-    fnName,
-    start: Date.now(),
-  };
-
-  return id;
-}
-
-function _updateJob(id, data) {
-  const { resolve, reject } = data;
-  const { fnName, start } = _jobs[id];
-
-  _jobs[id] = {
-    ..._jobs[id],
-    ...data,
-    resolve: value => {
-      _removeJob(id);
-      const end = Date.now();
-      window.log.info(
-        `Worker job ${id} (${fnName}) succeeded in ${end - start}ms`
-      );
-      return resolve(value);
-    },
-    reject: error => {
-      _removeJob(id);
-      const end = Date.now();
-      window.log.info(
-        `Worker job ${id} (${fnName}) failed in ${end - start}ms`
-      );
-      return reject(error);
-    },
-  };
-}
-
-function _removeJob(id) {
-  if (_DEBUG) {
-    _jobs[id].complete = true;
-  } else {
-    delete _jobs[id];
-  }
-}
-
-function _getJob(id) {
-  return _jobs[id];
-}
-
-async function callWorker(fnName, ...args) {
-  const jobId = _makeJob(fnName);
-
-  return new Promise((resolve, reject) => {
-    _utilWorker.postMessage([jobId, fnName, ...args]);
-
-    _updateJob(jobId, {
-      resolve,
-      reject,
-      args: _DEBUG ? args : null,
-    });
-
-    setTimeout(
-      () => reject(new Error(`Worker job ${jobId} (${fnName}) timed out`)),
-      WORKER_TIMEOUT
-    );
-  });
-}
-
-_utilWorker.onmessage = e => {
-  const [jobId, errorForDisplay, result] = e.data;
-
-  const job = _getJob(jobId);
-  if (!job) {
-    throw new Error(
-      `Received worker reply to job ${jobId}, but did not have it in our registry!`
-    );
-  }
-
-  const { resolve, reject, fnName } = job;
-
-  if (errorForDisplay) {
-    return reject(
-      new Error(
-        `Error received from worker job ${jobId} (${fnName}): ${errorForDisplay}`
-      )
-    );
-  }
-
-  return resolve(result);
-};
+const RETRY_TIMEOUT = 2 * 60 * 1000;
 
 function MessageReceiver(username, password, signalingKey, options = {}) {
   this.count = 0;
@@ -134,22 +33,39 @@ function MessageReceiver(username, password, signalingKey, options = {}) {
   this.number = address.getName();
   this.deviceId = address.getDeviceId();
 
-  this.pending = Promise.resolve();
+  this.incomingQueue = new window.PQueue({ concurrency: 1 });
+  this.pendingQueue = new window.PQueue({ concurrency: 1 });
+  this.appQueue = new window.PQueue({ concurrency: 1 });
+
+  this.cacheAddBatcher = window.Signal.Util.createBatcher({
+    wait: 200,
+    maxSize: 30,
+    processBatch: this.cacheAndQueueBatch.bind(this),
+  });
+  this.cacheUpdateBatcher = window.Signal.Util.createBatcher({
+    wait: 500,
+    maxSize: 30,
+    processBatch: this.cacheUpdateBatch.bind(this),
+  });
+  this.cacheRemoveBatcher = window.Signal.Util.createBatcher({
+    wait: 500,
+    maxSize: 30,
+    processBatch: this.cacheRemoveBatch.bind(this),
+  });
 
   if (options.retryCached) {
-    this.pending = this.queueAllCached();
+    this.pendingQueue.add(() => this.queueAllCached());
   }
 }
 
 MessageReceiver.stringToArrayBuffer = string =>
-  Promise.resolve(dcodeIO.ByteBuffer.wrap(string, 'binary').toArrayBuffer());
+  dcodeIO.ByteBuffer.wrap(string, 'binary').toArrayBuffer();
 MessageReceiver.arrayBufferToString = arrayBuffer =>
-  Promise.resolve(dcodeIO.ByteBuffer.wrap(arrayBuffer).toString('binary'));
-
+  dcodeIO.ByteBuffer.wrap(arrayBuffer).toString('binary');
 MessageReceiver.stringToArrayBufferBase64 = string =>
-  callWorker('stringToArrayBufferBase64', string);
+  dcodeIO.ByteBuffer.wrap(string, 'base64').toArrayBuffer();
 MessageReceiver.arrayBufferToStringBase64 = arrayBuffer =>
-  callWorker('arrayBufferToStringBase64', arrayBuffer);
+  dcodeIO.ByteBuffer.wrap(arrayBuffer).toString('base64');
 
 MessageReceiver.prototype = new textsecure.EventTarget();
 MessageReceiver.prototype.extend({
@@ -165,6 +81,7 @@ MessageReceiver.prototype.extend({
       this.dispatchEvent(ev);
     }
 
+    this.isEmptied = false;
     this.hasConnected = true;
 
     if (this.socket && this.socket.readyState !== WebSocket.CLOSED) {
@@ -187,15 +104,17 @@ MessageReceiver.prototype.extend({
     // Because sometimes the socket doesn't properly emit its close event
     this._onClose = this.onclose.bind(this);
     this.wsr.addEventListener('close', this._onClose);
-
-    // Ensures that an immediate 'empty' event from the websocket will fire only after
-    //   all cached envelopes are processed.
-    this.incoming = [this.pending];
   },
   stopProcessing() {
     window.log.info('MessageReceiver: stopProcessing requested');
     this.stoppingProcessing = true;
     return this.close();
+  },
+  unregisterBatchers() {
+    window.log.info('MessageReceiver: unregister batchers');
+    this.cacheAddBatcher.unregister();
+    this.cacheUpdateBatcher.unregister();
+    this.cacheRemoveBatcher.unregister();
   },
   shutdown() {
     if (this.socket) {
@@ -220,6 +139,8 @@ MessageReceiver.prototype.extend({
       this.wsr.close(3000, 'called close');
     }
 
+    this.clearRetryTimeout();
+
     return this.drain();
   },
   onopen() {
@@ -229,11 +150,7 @@ MessageReceiver.prototype.extend({
     window.log.error('websocket error');
   },
   dispatchAndWait(event) {
-    const promise = this.appPromise || Promise.resolve();
-    const appJobPromise = Promise.all(this.dispatchEvent(event));
-    const job = () => appJobPromise;
-
-    this.appPromise = promise.then(job, job);
+    this.appQueue.add(() => Promise.all(this.dispatchEvent(event)));
 
     return Promise.resolve();
   },
@@ -268,9 +185,6 @@ MessageReceiver.prototype.extend({
       });
   },
   handleRequest(request) {
-    this.incoming = this.incoming || [];
-    const lastPromise = _.last(this.incoming);
-
     // We do the message decryption here, instead of in the ordered pending queue,
     // to avoid exposing the time it took us to process messages through the time-to-ack.
 
@@ -279,31 +193,33 @@ MessageReceiver.prototype.extend({
       request.respond(200, 'OK');
 
       if (request.verb === 'PUT' && request.path === '/api/v1/queue/empty') {
-        this.onEmpty();
+        this.incomingQueue.add(() => this.onEmpty());
       }
       return;
     }
 
-    let promise;
-    const headers = request.headers || [];
-    if (headers.includes('X-Signal-Key: true')) {
-      promise = textsecure.crypto.decryptWebsocketMessage(
-        request.body,
-        this.signalingKey
-      );
-    } else {
-      promise = Promise.resolve(request.body.toArrayBuffer());
-    }
+    const job = async () => {
+      let plaintext;
+      const headers = request.headers || [];
 
-    promise = promise
-      .then(plaintext => {
+      if (headers.includes('X-Signal-Key: true')) {
+        plaintext = await textsecure.crypto.decryptWebsocketMessage(
+          request.body,
+          this.signalingKey
+        );
+      } else {
+        plaintext = request.body.toArrayBuffer();
+      }
+
+      try {
         const envelope = textsecure.protobuf.Envelope.decode(plaintext);
         // After this point, decoding errors are not the server's
         //   fault, and we should handle them gracefully and tell the
         //   user they received an invalid message
 
         if (this.isBlocked(envelope.source)) {
-          return request.respond(200, 'OK');
+          request.respond(200, 'OK');
+          return;
         }
 
         envelope.id = envelope.serverGuid || window.getGuid();
@@ -311,24 +227,8 @@ MessageReceiver.prototype.extend({
           ? envelope.serverTimestamp.toNumber()
           : null;
 
-        return this.addToCache(envelope, plaintext).then(
-          async () => {
-            request.respond(200, 'OK');
-
-            // To ensure that we queue in the same order we receive messages
-            await lastPromise;
-            this.queueEnvelope(envelope);
-          },
-          error => {
-            request.respond(500, 'Failed to cache message');
-            window.log.error(
-              'handleRequest error trying to add message to cache:',
-              error && error.stack ? error.stack : error
-            );
-          }
-        );
-      })
-      .catch(e => {
+        this.cacheAndQueue(envelope, plaintext, request);
+      } catch (e) {
         request.respond(500, 'Bad encrypted websocket message');
         window.log.error(
           'Error handling incoming message:',
@@ -336,75 +236,68 @@ MessageReceiver.prototype.extend({
         );
         const ev = new Event('error');
         ev.error = e;
-        return this.dispatchAndWait(ev);
-      });
-
-    this.incoming.push(promise);
-  },
-  addToQueue(task) {
-    this.count += 1;
-    this.pending = this.pending.then(task, task);
-
-    const { count, pending } = this;
-
-    const cleanup = () => {
-      this.updateProgress(count);
-      // We want to clear out the promise chain whenever possible because it could
-      //   lead to large memory usage over time:
-      //   https://github.com/nodejs/node/issues/6673#issuecomment-244331609
-      if (this.pending === pending) {
-        this.pending = Promise.resolve();
+        await this.dispatchAndWait(ev);
       }
     };
 
-    pending.then(cleanup, cleanup);
+    this.incomingQueue.add(job);
+  },
+  addToQueue(task) {
+    this.count += 1;
 
-    return pending;
+    const promise = this.pendingQueue.add(task);
+
+    const { count } = this;
+
+    const update = () => {
+      this.updateProgress(count);
+    };
+
+    promise.then(update, update);
+
+    return promise;
   },
   onEmpty() {
-    const { incoming } = this;
-    this.incoming = [];
-
     const emitEmpty = () => {
       window.log.info("MessageReceiver: emitting 'empty' event");
       const ev = new Event('empty');
       this.dispatchAndWait(ev);
+      this.isEmptied = true;
+
+      this.maybeScheduleRetryTimeout();
     };
 
-    const waitForApplication = async () => {
+    const waitForPendingQueue = () => {
       window.log.info(
         "MessageReceiver: finished processing messages after 'empty', now waiting for application"
       );
-      const promise = this.appPromise || Promise.resolve();
-      this.appPromise = Promise.resolve();
 
-      // We don't await here because we don't this to gate future message processing
-      promise.then(emitEmpty, emitEmpty);
+      // We don't await here because we don't want this to gate future message processing
+      this.appQueue.add(emitEmpty);
     };
 
-    const waitForEmptyQueue = () => {
-      // resetting count to zero so everything queued after this starts over again
+    const waitForIncomingQueue = () => {
+      this.addToQueue(waitForPendingQueue);
+
+      // Note: this.count is used in addToQueue
+      // Resetting count so everything from the websocket after this starts at zero
       this.count = 0;
-
-      this.addToQueue(waitForApplication);
     };
 
-    // We first wait for all recently-received messages (this.incoming) to be queued,
-    //   then we queue a task to wait for the application to finish its processing, then
-    //   finally we emit the 'empty' event to the queue.
-    Promise.all(incoming).then(waitForEmptyQueue, waitForEmptyQueue);
+    const waitForCacheAddBatcher = async () => {
+      await this.cacheAddBatcher.onIdle();
+      this.incomingQueue.add(waitForIncomingQueue);
+    };
+
+    waitForCacheAddBatcher();
   },
   drain() {
-    const { incoming } = this;
-    this.incoming = [];
-
-    const queueDispatch = () =>
+    const waitForIncomingQueue = () =>
       this.addToQueue(() => {
         window.log.info('drained');
       });
 
-    // This promise will resolve when there are no more messages to be processed.
-    return Promise.all(incoming).then(queueDispatch, queueDispatch);
+    return this.incomingQueue.add(waitForIncomingQueue);
   },
   updateProgress(count) {
     // count by 10s
@@ -427,13 +320,13 @@ MessageReceiver.prototype.extend({
       let envelopePlaintext = item.envelope;
 
       if (item.version === 2) {
-        envelopePlaintext = await MessageReceiver.stringToArrayBufferBase64(
+        envelopePlaintext = MessageReceiver.stringToArrayBufferBase64(
           envelopePlaintext
         );
       }
 
       if (typeof envelopePlaintext === 'string') {
-        envelopePlaintext = await MessageReceiver.stringToArrayBuffer(
+        envelopePlaintext = MessageReceiver.stringToArrayBuffer(
           envelopePlaintext
         );
       }
@@ -449,13 +342,13 @@ MessageReceiver.prototype.extend({
         let payloadPlaintext = decrypted;
 
         if (item.version === 2) {
-          payloadPlaintext = await MessageReceiver.stringToArrayBufferBase64(
+          payloadPlaintext = MessageReceiver.stringToArrayBufferBase64(
             payloadPlaintext
           );
         }
 
         if (typeof payloadPlaintext === 'string') {
-          payloadPlaintext = await MessageReceiver.stringToArrayBuffer(
+          payloadPlaintext = MessageReceiver.stringToArrayBuffer(
             payloadPlaintext
           );
         }
@@ -492,6 +385,20 @@ MessageReceiver.prototype.extend({
     }
 
     return envelope.id;
+  },
+  clearRetryTimeout() {
+    if (this.retryCachedTimeout) {
+      clearInterval(this.retryCachedTimeout);
+      this.retryCachedTimeout = null;
+    }
+  },
+  maybeScheduleRetryTimeout() {
+    if (this.isEmptied) {
+      this.clearRetryTimeout();
+      this.retryCachedTimeout = setTimeout(() => {
+        this.pendingQueue.add(() => this.queueAllCached());
+      }, RETRY_TIMEOUT);
+    }
   },
   async getAllFromCache() {
     window.log.info('getAllFromCache');
@@ -536,44 +443,60 @@ MessageReceiver.prototype.extend({
       })
     );
   },
-  async addToCache(envelope, plaintext) {
+  async cacheAndQueueBatch(items) {
+    const dataArray = items.map(item => item.data);
+    try {
+      await textsecure.storage.unprocessed.batchAdd(dataArray);
+      items.forEach(item => {
+        item.request.respond(200, 'OK');
+        this.queueEnvelope(item.envelope);
+      });
+
+      this.maybeScheduleRetryTimeout();
+    } catch (error) {
+      items.forEach(item => {
+        item.request.respond(500, 'Failed to cache message');
+      });
+      window.log.error(
+        'cacheAndQueue error trying to add messages to cache:',
+        error && error.stack ? error.stack : error
+      );
+    }
+  },
+  cacheAndQueue(envelope, plaintext, request) {
     const { id } = envelope;
     const data = {
       id,
       version: 2,
-      envelope: await MessageReceiver.arrayBufferToStringBase64(plaintext),
+      envelope: MessageReceiver.arrayBufferToStringBase64(plaintext),
       timestamp: Date.now(),
       attempts: 1,
     };
-    return textsecure.storage.unprocessed.add(data);
+    this.cacheAddBatcher.add({
+      request,
+      envelope,
+      data,
+    });
   },
-  async updateCache(envelope, plaintext) {
+  async cacheUpdateBatch(items) {
+    await textsecure.storage.unprocessed.addDecryptedDataToList(items);
+  },
+  updateCache(envelope, plaintext) {
     const { id } = envelope;
-    const item = await textsecure.storage.unprocessed.get(id);
-    if (!item) {
-      window.log.error(
-        `updateCache: Didn't find item ${id} in cache to update`
-      );
-      return null;
-    }
-
-    item.source = envelope.source;
-    item.sourceDevice = envelope.sourceDevice;
-    item.serverTimestamp = envelope.serverTimestamp;
-
-    if (item.version === 2) {
-      item.decrypted = await MessageReceiver.arrayBufferToStringBase64(
-        plaintext
-      );
-    } else {
-      item.decrypted = await MessageReceiver.arrayBufferToString(plaintext);
-    }
-
-    return textsecure.storage.unprocessed.addDecryptedData(item.id, item);
+    const data = {
+      source: envelope.source,
+      sourceDevice: envelope.sourceDevice,
+      serverTimestamp: envelope.serverTimestamp,
+      decrypted: MessageReceiver.arrayBufferToStringBase64(plaintext),
+    };
+    this.cacheUpdateBatcher.add({ id, data });
+  },
+  async cacheRemoveBatch(items) {
+    await textsecure.storage.unprocessed.remove(items);
   },
   removeFromCache(envelope) {
     const { id } = envelope;
-    return textsecure.storage.unprocessed.remove(id);
+    this.cacheRemoveBatcher.add(id);
   },
   queueDecryptedEnvelope(envelope, plaintext) {
     const id = this.getEnvelopeId(envelope);
@@ -607,7 +530,7 @@ MessageReceiver.prototype.extend({
     return promise.catch(error => {
       window.log.error(
         'queueEnvelope error handling envelope',
-        id,
+        this.getEnvelopeId(envelope),
         ':',
         error && error.stack ? error.stack : error
       );
@@ -797,9 +720,8 @@ MessageReceiver.prototype.extend({
                 throw error;
               }
 
-              return this.removeFromCache(envelope).then(() => {
-                throw error;
-              });
+              this.removeFromCache(envelope);
+              throw error;
             }
           );
         break;
@@ -815,12 +737,9 @@ MessageReceiver.prototype.extend({
           return null;
         }
 
-        this.updateCache(envelope, plaintext).catch(error => {
-          window.log.error(
-            'decrypt failed to save decrypted message contents to cache:',
-            error && error.stack ? error.stack : error
-          );
-        });
+        // Note: this is an out of band update; there are cases where the item in the
+        //   cache has already been deleted by the time this runs. That's okay.
+        this.updateCache(envelope, plaintext);
 
         return plaintext;
       })
@@ -865,12 +784,14 @@ MessageReceiver.prototype.extend({
       throw e;
     }
   },
-  handleSentMessage(envelope, sentContainer, msg) {
+  handleSentMessage(envelope, sentContainer) {
     const {
       destination,
       timestamp,
+      message: msg,
       expirationStartTimestamp,
       unidentifiedStatus,
+      isRecipientUpdate,
     } = sentContainer;
 
     let p = Promise.resolve();
@@ -905,6 +826,7 @@ MessageReceiver.prototype.extend({
           device: envelope.sourceDevice,
           unidentifiedStatus,
           message,
+          isRecipientUpdate,
         };
         if (expirationStartTimestamp) {
           ev.data.expirationStartTimestamp = expirationStartTimestamp.toNumber();
@@ -1090,7 +1012,7 @@ MessageReceiver.prototype.extend({
         'from',
         this.getEnvelopeId(envelope)
       );
-      return this.handleSentMessage(envelope, sentMessage, sentMessage.message);
+      return this.handleSentMessage(envelope, sentMessage);
     } else if (syncMessage.contacts) {
       return this.handleContacts(envelope, syncMessage.contacts);
     } else if (syncMessage.groups) {
@@ -1107,7 +1029,19 @@ MessageReceiver.prototype.extend({
       return this.handleVerified(envelope, syncMessage.verified);
     } else if (syncMessage.configuration) {
       return this.handleConfiguration(envelope, syncMessage.configuration);
+    } else if (
+      syncMessage.stickerPackOperation &&
+      syncMessage.stickerPackOperation.length > 0
+    ) {
+      return this.handleStickerPackOperation(
+        envelope,
+        syncMessage.stickerPackOperation
+      );
+    } else if (syncMessage.viewOnceOpen) {
+      return this.handleViewOnceOpen(envelope, syncMessage.viewOnceOpen);
     }
+
+    this.removeFromCache(envelope);
     throw new Error('Got empty SyncMessage');
   },
   handleConfiguration(envelope, configuration) {
@@ -1115,6 +1049,29 @@ MessageReceiver.prototype.extend({
     const ev = new Event('configuration');
     ev.confirm = this.removeFromCache.bind(this, envelope);
     ev.configuration = configuration;
+    return this.dispatchAndWait(ev);
+  },
+  handleViewOnceOpen(envelope, sync) {
+    window.log.info('got view once open sync message');
+
+    const ev = new Event('viewSync');
+    ev.confirm = this.removeFromCache.bind(this, envelope);
+    ev.source = sync.sender;
+    ev.timestamp = sync.timestamp ? sync.timestamp.toNumber() : null;
+
+    return this.dispatchAndWait(ev);
+  },
+  handleStickerPackOperation(envelope, operations) {
+    const ENUM = textsecure.protobuf.SyncMessage.StickerPackOperation.Type;
+    window.log.info('got sticker pack operation sync message');
+    const ev = new Event('sticker-pack');
+    ev.confirm = this.removeFromCache.bind(this, envelope);
+    ev.stickerPacks = operations.map(operation => ({
+      id: operation.packId ? operation.packId.toString('hex') : null,
+      key: operation.packKey ? operation.packKey.toString('base64') : null,
+      isInstall: operation.type === ENUM.INSTALL,
+      isRemove: operation.type === ENUM.REMOVE,
+    }));
     return this.dispatchAndWait(ev);
   },
   handleVerified(envelope, verified) {
@@ -1145,6 +1102,8 @@ MessageReceiver.prototype.extend({
     window.log.info('contact sync');
     const { blob } = contacts;
 
+    this.removeFromCache(envelope);
+
     // Note: we do not return here because we don't want to block the next message on
     //   this attachment download and a lot of processing of that attachment.
     this.handleAttachment(blob).then(attachmentPointer => {
@@ -1164,13 +1123,14 @@ MessageReceiver.prototype.extend({
 
       return Promise.all(results).then(() => {
         window.log.info('handleContacts: finished');
-        return this.removeFromCache(envelope);
       });
     });
   },
   handleGroups(envelope, groups) {
     window.log.info('group sync');
     const { blob } = groups;
+
+    this.removeFromCache(envelope);
 
     // Note: we do not return here because we don't want to block the next message on
     //   this attachment download and a lot of processing of that attachment.
@@ -1181,7 +1141,6 @@ MessageReceiver.prototype.extend({
       while (groupDetails !== undefined) {
         groupDetails.id = groupDetails.id.toBinary();
         const ev = new Event('group');
-        ev.confirm = this.removeFromCache.bind(this, envelope);
         ev.groupDetails = groupDetails;
         const promise = this.dispatchAndWait(ev).catch(e => {
           window.log.error('error processing group', e);
@@ -1192,7 +1151,6 @@ MessageReceiver.prototype.extend({
 
       Promise.all(promises).then(() => {
         const ev = new Event('groupsync');
-        ev.confirm = this.removeFromCache.bind(this, envelope);
         return this.dispatchAndWait(ev);
       });
     });
@@ -1228,23 +1186,29 @@ MessageReceiver.prototype.extend({
     const encrypted = await this.server.getAttachment(attachment.id);
     const { key, digest, size } = attachment;
 
+    if (!digest) {
+      throw new Error('Failure: Ask sender to update Signal and resend.');
+    }
+
     const data = await textsecure.crypto.decryptAttachment(
       encrypted,
       window.Signal.Crypto.base64ToArrayBuffer(key),
       window.Signal.Crypto.base64ToArrayBuffer(digest)
     );
 
-    if (!size || size !== data.byteLength) {
+    if (!_.isNumber(size)) {
       throw new Error(
-        `downloadAttachment: Size ${size} did not match downloaded attachment size ${
+        `downloadAttachment: Size was not provided, actual size was ${
           data.byteLength
         }`
       );
     }
 
+    const typedArray = window.Signal.Crypto.getFirstBytes(data, size);
+
     return {
       ..._.omit(attachment, 'digest', 'key'),
-      data,
+      data: window.Signal.Crypto.typedArrayToArrayBuffer(typedArray),
     };
   },
   handleAttachment(attachment) {
@@ -1276,6 +1240,25 @@ MessageReceiver.prototype.extend({
     //   processing
     // Note that messages may (generally) only perform one action and we ignore remaining
     //   fields after the first action.
+
+    if (window.TIMESTAMP_VALIDATION) {
+      if (!envelope.timestamp || !decrypted.timestamp) {
+        throw new Error('Missing timestamp on dataMessage or envelope');
+      }
+
+      const envelopeTimestamp = envelope.timestamp.toNumber();
+      const decryptedTimestamp = decrypted.timestamp.toNumber();
+
+      if (envelopeTimestamp !== decryptedTimestamp) {
+        throw new Error(
+          `Timestamp ${
+            decrypted.timestamp
+          } in DataMessage did not match envelope timestamp ${
+            envelope.timestamp
+          }`
+        );
+      }
+    }
 
     if (decrypted.flags == null) {
       decrypted.flags = 0;
@@ -1395,6 +1378,19 @@ MessageReceiver.prototype.extend({
       );
     }
 
+    const { sticker } = decrypted;
+    if (sticker) {
+      if (sticker.packId) {
+        sticker.packId = sticker.packId.toString('hex');
+      }
+      if (sticker.packKey) {
+        sticker.packKey = sticker.packKey.toString('base64');
+      }
+      if (sticker.data) {
+        sticker.data = this.cleanAttachment(sticker.data);
+      }
+    }
+
     return Promise.all(promises).then(() => decrypted);
     /* eslint-enable no-bitwise, no-param-reassign */
   },
@@ -1427,6 +1423,9 @@ textsecure.MessageReceiver = function MessageReceiverWrapper(
     messageReceiver
   );
   this.stopProcessing = messageReceiver.stopProcessing.bind(messageReceiver);
+  this.unregisterBatchers = messageReceiver.unregisterBatchers.bind(
+    messageReceiver
+  );
 
   messageReceiver.connect();
 };
